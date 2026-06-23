@@ -32,7 +32,7 @@ def _o_scale(acc_o, m_i, lse_i):
 
 
 def causal_bert_torch(q, k, v, w, causal=False, softmax_scale=None,
-                      block_M=16, block_N=64,
+                      block_M=64, block_N=64,
                       la_block_n_size=2):
     """Faithful PyTorch equivalent of `_flash_attn_causal_bert_forward`.
 
@@ -174,15 +174,13 @@ def causal_bert_torch_v2(
     nM = S // BM
     oob = [False]
 
-    def load_block(T, pos):
-        # mirrors _load_k/_load_v with mask other=0.0 for rows past the valid range.
+    def load_block(T, pos, seqlen_mask):
         out = torch.zeros(B, H, BN, D, dtype=T.dtype, device=dev)
         end = min(pos + BN, S)
         if 0 <= pos < S and end > pos:
             out[:, :, : end - pos, :] = T[:, :, pos:end, :]
-        elif pos + BN > S and not oob[0]:
-            warnings.warn(f"lookahead block reads past seqlen (pos={pos}, S={S})")
-            oob[0] = True
+        keep = (pos + ar) < seqlen_mask
+        out = out * keep[None, None, :, None].to(out.dtype)
         return out
 
     for mb in range(nM):
@@ -203,8 +201,8 @@ def causal_bert_torch_v2(
                 next_n = near_m_n - i * BN
                 if next_n >= start_n:                 # kernel's guard on the lookahead read
                     ran = True
-                    kb = load_block(K, next_n)
-                    vb = load_block(V, next_n)
+                    kb = load_block(K, next_n, seqlen_mask=mb * BM)
+                    vb = load_block(V, next_n, seqlen_mask=mb * BM)
                     s = torch.einsum("bhid,bhjd->bhij", q_from_n, kb) * softmax_scale
                     # kernel passes EVEN_N=False, seqlen_k=mb*BM -> mask cols >= mb*BM
                     col = next_n + ar
@@ -232,8 +230,8 @@ def causal_bert_torch_v2(
             delta_k = torch.einsum("bhid,hde->bhie", o_la, Wk)
             delta_v = torch.einsum("bhid,hde->bhie", o_la, Wv)
 
-            k_mod = load_block(K, start_n) + delta_k
-            v_mod = load_block(V, start_n) + delta_v
+            k_mod = load_block(K, start_n, seqlen_mask=S) + delta_k
+            v_mod = load_block(V, start_n, seqlen_mask=S) + delta_v
             if cast_kv_fp16:
                 k_mod = k_mod.half().to(dtype)
                 v_mod = v_mod.half().to(dtype)
