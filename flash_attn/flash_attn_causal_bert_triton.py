@@ -341,6 +341,7 @@ def _fwd_kernel_causal_bert(
 
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
+
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
@@ -358,38 +359,45 @@ def _fwd_kernel_causal_bert(
             EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_M, EVEN_N=EVEN_N)
 
         # also read the block right before query m's block
-        nearby_n = tl.cdiv(start_m * BLOCK_M, BLOCK_N) * BLOCK_N
-        nearby_n = tl.multiple_of(nearby_n, BLOCK_N)
+        near_m_n = (tl.cdiv(start_m * BLOCK_M, BLOCK_N) - 1) * BLOCK_N
+        near_m_n = tl.multiple_of(near_m_n, BLOCK_N)
         
-        for i in range(LA_BLOCK_N_SIZE+1):
-            if i < LA_BLOCK_N_SIZE:
-                next_n = start_n + i * BLOCK_N
-            else:
-                next_n = nearby_n
+        # iterate starts from block m. This way, it can collect as many historical tokens as possible
+        for i in range(LA_BLOCK_N_SIZE):
+            next_n = near_m_n - i * BLOCK_N
 
-            k_from_n = _load_k(k_ptrs=k_ptrs, start_n=next_n, stride_kn=stride_kn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m*BLOCK_M,
-                    headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_M, EVEN_N=EVEN_N)
-            v_from_n = _load_v(v_ptrs=v_ptrs, start_n=next_n, stride_vn=stride_vn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m*BLOCK_M,
-                    headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_N, EVEN_N=EVEN_N)
+            if next_n >= start_n:
+                k_from_n = _load_k(k_ptrs=k_ptrs, start_n=next_n, stride_kn=stride_kn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m*BLOCK_M,
+                        headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=tl.constexpr(False), EVEN_N=tl.constexpr(False))
+                v_from_n = _load_v(v_ptrs=v_ptrs, start_n=next_n, stride_vn=stride_vn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m*BLOCK_M,
+                        headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=tl.constexpr(False), EVEN_N=tl.constexpr(False))
 
-            if BIAS_TYPE != "none":
-                bias_from_n = _load_bias(b_ptrs=b_ptrs, start_n=next_n, offs_m=offs_m_from_n, offs_n=offs_n, 
-                                seqlen_q=seqlen_q, seqlen_k=seqlen_k, BIAS_TYPE=BIAS_TYPE, EVEN_M=EVEN_M, EVEN_N=EVEN_N)
-            else:
-                bias_from_n = None
+                if BIAS_TYPE != "none":
+                    bias_from_n = _load_bias(b_ptrs=b_ptrs, start_n=next_n, offs_m=offs_m_from_n, offs_n=offs_n, 
+                                    seqlen_q=seqlen_q, seqlen_k=seqlen_k, BIAS_TYPE=BIAS_TYPE, EVEN_M=EVEN_M, EVEN_N=EVEN_N)
+                else:
+                    bias_from_n = None
 
-            acc_o_from_n, m_i_from_n, lse_i_from_n = \
-                  _fwd_kernel_inner(q=q_from_n, k=k_from_n, v=v_from_n, bias=bias_from_n,
-                acc_o=acc_o_from_n, m_i=m_i_from_n, lse_i=lse_i_from_n, 
-                start_n=start_n, t_ptrs=t_ptrs,
-                offs_m=offs_m, offs_n=offs_n, offs_d=offs_d, 
-                headdim=headdim, softmax_scale=softmax_scale,
-                seqlen_k=seqlen_k,
-                EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_M, EVEN_N=EVEN_N,
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BIAS_TYPE=BIAS_TYPE, IS_CAUSAL=IS_CAUSAL,
-                )
+                acc_o_from_n, m_i_from_n, lse_i_from_n = \
+                    _fwd_kernel_inner(q=q_from_n, k=k_from_n, v=v_from_n, bias=bias_from_n,
+                    acc_o=acc_o_from_n, m_i=m_i_from_n, lse_i=lse_i_from_n, 
+                    start_n=next_n, t_ptrs=t_ptrs,
+                    offs_m=offs_m_from_n, offs_n=offs_n, offs_d=offs_d, 
+                    headdim=headdim, softmax_scale=softmax_scale,
+                    seqlen_k=start_m*BLOCK_M,
+                    EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=tl.constexpr(False), EVEN_N=tl.constexpr(False),
+                    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BIAS_TYPE=BIAS_TYPE, IS_CAUSAL=tl.constexpr(False),
+                    )
 
-        acc_o_from_n = _o_scale(acc_o=acc_o_from_n, m_i=m_i_from_n, lse_i=lse_i_from_n, t_ptrs=t_ptrs) # (bN, d)
+        # when start_m <= start_n, no look ahead iterations take place. therefore, m_i, lse_i are all infinite.
+        if start_m > start_n:
+            acc_o_from_n = _o_scale(acc_o=acc_o_from_n, m_i=m_i_from_n, lse_i=lse_i_from_n, t_ptrs=t_ptrs) # (bN, d)
+        # NaN is the only value not equal to itself
+        nan_mask = (acc_o_from_n != acc_o_from_n).to(tl.int32)
+        has_nan = tl.sum(nan_mask)          # reduce to a scalar
+        if has_nan > 0 and start_m == 14:
+            tl.device_print("start_m_n", start_n)
+
         delta_k = tl.dot(acc_o_from_n, w_k)   
         delta_v = tl.dot(acc_o_from_n, w_v)
 
