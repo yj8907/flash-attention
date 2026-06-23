@@ -5,7 +5,7 @@ import math
 import torch
 import triton
 import triton.language as tl
-
+import warnings
 
 
 @triton.jit
@@ -153,8 +153,8 @@ def _o_scale(
     
     o_scale = tl.exp(m_i - lse_i)
     # BUG: have to store and immediately load
-    tl.store(t_ptrs, o_scale)
-    o_scale = tl.load(t_ptrs)
+    # tl.store(t_ptrs, o_scale)
+    # o_scale = tl.load(t_ptrs)
     acc_o = acc_o * o_scale[:, None]
 
     return acc_o
@@ -185,7 +185,7 @@ def _fwd_kernel_inner(
 ):
 
     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    qk += tl.dot(q, k.T, out_dtype=tl.float32)
+    qk += tl.dot(q, k.T)
     # Trying to combine the two masks seem to make the result wrong
     if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
         qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
@@ -208,8 +208,8 @@ def _fwd_kernel_inner(
 
     # # -- update output accumulator --
     # BUG: have to store and immediately load
-    tl.store(t_ptrs, acc_o_scale)
-    acc_o_scale = tl.load(t_ptrs)
+    # tl.store(t_ptrs, acc_o_scale)
+    # acc_o_scale = tl.load(t_ptrs)
     acc_o = acc_o * acc_o_scale[:, None]
     # update acc_o
     p = p.to(v.dtype)
@@ -343,7 +343,7 @@ def _fwd_kernel_causal_bert(
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        
+
         # prologue
         lse_i_from_n = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         m_i_from_n = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -367,9 +367,9 @@ def _fwd_kernel_causal_bert(
             else:
                 next_n = nearby_n
 
-            k_from_n = _load_k(k_ptrs=k_ptrs, start_n=next_n, stride_kn=stride_kn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m,
+            k_from_n = _load_k(k_ptrs=k_ptrs, start_n=next_n, stride_kn=stride_kn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m*BLOCK_M,
                     headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_M, EVEN_N=EVEN_N)
-            v_from_n = _load_v(v_ptrs=v_ptrs, start_n=next_n, stride_vn=stride_vn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m,
+            v_from_n = _load_v(v_ptrs=v_ptrs, start_n=next_n, stride_vn=stride_vn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m*BLOCK_M,
                     headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_N, EVEN_N=EVEN_N)
 
             if BIAS_TYPE != "none":
@@ -536,3 +536,114 @@ def _flash_attn_causal_bert_forward(q, k, v, w, bias=None, causal=False, softmax
     return o, lse, softmax_scale  # softmax_scale could have been updated
 
 
+
+def causal_bert_reference(
+    q, k, v, w,
+    causal=True,
+    softmax_scale=None,
+    block=64,
+    la_block_n_size=2,
+    faithful_lookahead_mask=True,
+    cast_kv_fp16=False,
+    compute_dtype=torch.float32,
+):
+    """
+    q, k, v : [B, S, H, D]   (assumes seqlen_q == seqlen_k == S, S % block == 0)
+    w       : [H, D, 2*D]    w[h,:,:D] = W_k, w[h,:,D:] = W_v
+    returns o:[B,S,H,D], lse:[B,H,S]
+    """
+    B, S, H, D = q.shape
+    assert k.shape == (B, S, H, D) and v.shape == (B, S, H, D)
+    assert w.shape == (H, D, 2 * D), f"w must be [H, D, 2D], got {tuple(w.shape)}"
+    assert S % block == 0, "reference assumes seqlen divisible by block"
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(D)
+ 
+    BLK, LA, nM, NEG = block, la_block_n_size, S // block, float("-inf")
+    dev, dt = q.device, compute_dtype
+ 
+    Q = q.permute(0, 2, 1, 3).to(dt)            # [B,H,S,D]
+    K = k.permute(0, 2, 1, 3).to(dt)
+    V = v.permute(0, 2, 1, 3).to(dt)
+    W = w.to(dt)
+    Wk, Wv = W[:, :, :D], W[:, :, D:]           # [H,D,D] each
+ 
+    O = torch.zeros(B, H, S, D, dtype=dt, device=dev)
+    LSE = torch.full((B, H, S), NEG, dtype=dt, device=dev)
+    arangeBLK = torch.arange(BLK, device=dev)
+    oob_warned = [False]
+ 
+    def load_block(T, start):
+        end = start + BLK
+        if end <= S:
+            return T[:, :, start:end, :]
+        if not oob_warned[0]:
+            warnings.warn(f"lookahead reads past seqlen (start={start}, S={S}); "
+                          "kernel does OOB/UB here, reference zero-pads.")
+            oob_warned[0] = True
+        out = torch.zeros(B, H, BLK, D, dtype=T.dtype, device=T.device)
+        valid = max(0, S - start)
+        if valid:
+            out[:, :, :valid, :] = T[:, :, start:S, :]
+        return out
+ 
+    for mb in range(nM):
+        offs_m = mb * BLK + arangeBLK                       # main query positions
+        q_main = Q[:, :, mb * BLK:(mb + 1) * BLK, :]
+        end_n = S if not causal else min((mb + 1) * BLK, S)
+        nearby_n = mb * BLK
+ 
+        K_mod_blocks, V_mod_blocks, keypos_blocks = [], [], []
+ 
+        for start_n in range(0, end_n, BLK):
+            q_from_n = Q[:, :, start_n:start_n + BLK, :]
+            offs_m_from_n = start_n + arangeBLK
+            next_list = [start_n + i * BLK for i in range(LA)] + [nearby_n]
+ 
+            # faithful lookahead mask: uses OUTER offs_m / OUTER start_n, same for all blocks
+            if causal and faithful_lookahead_mask:
+                col = start_n + arangeBLK
+                Mla = torch.where(offs_m[:, None] >= col[None, :], 0.0, NEG)
+ 
+            la_scores, la_vals = [], []
+            for nn in next_list:
+                kb, vb = load_block(K, nn), load_block(V, nn)
+                s = torch.einsum("bhid,bhjd->bhij", q_from_n, kb) * softmax_scale
+                if causal:
+                    if faithful_lookahead_mask:
+                        s = s + Mla[None, None]
+                    else:
+                        col = nn + arangeBLK
+                        m = torch.where(offs_m_from_n[:, None] >= col[None, :], 0.0, NEG)
+                        s = s + m[None, None]
+                la_scores.append(s)
+                la_vals.append(vb)
+            la_p = torch.softmax(torch.cat(la_scores, dim=-1), dim=-1)
+            o_la = torch.einsum("bhij,bhjd->bhid", la_p, torch.cat(la_vals, dim=-2))
+ 
+            delta_k = torch.einsum("bhid,hde->bhie", o_la, Wk)
+            delta_v = torch.einsum("bhid,hde->bhie", o_la, Wv)
+ 
+            k_mod = load_block(K, start_n) + delta_k
+            v_mod = load_block(V, start_n) + delta_v
+            if cast_kv_fp16:
+                k_mod, v_mod = k_mod.half().to(dt), v_mod.half().to(dt)
+ 
+            K_mod_blocks.append(k_mod)
+            V_mod_blocks.append(v_mod)
+            keypos_blocks.append(start_n + arangeBLK)
+ 
+        K_mod = torch.cat(K_mod_blocks, dim=-2)             # [B,H,end_n,D]
+        V_mod = torch.cat(V_mod_blocks, dim=-2)
+        keypos = torch.cat(keypos_blocks, dim=-1)
+ 
+        scores = torch.einsum("bhid,bhjd->bhij", q_main, K_mod) * softmax_scale
+        if causal:
+            scores = scores + torch.where(
+                offs_m[:, None] >= keypos[None, :], 0.0, NEG)[None, None]
+ 
+        LSE[:, :, mb * BLK:(mb + 1) * BLK] = torch.logsumexp(scores, dim=-1)
+        O[:, :, mb * BLK:(mb + 1) * BLK, :] = torch.einsum(
+            "bhij,bhjd->bhid", torch.softmax(scores, dim=-1), V_mod)
+ 
+    return O.permute(0, 2, 1, 3).contiguous(), LSE
