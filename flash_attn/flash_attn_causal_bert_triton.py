@@ -185,7 +185,7 @@ def _fwd_kernel_inner(
 ):
 
     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    qk += tl.dot(q, k, trans_b=True)
+    qk += tl.dot(q, k.T, out_dtype=tl.float32)
     # Trying to combine the two masks seem to make the result wrong
     if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
         qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
@@ -214,14 +214,15 @@ def _fwd_kernel_inner(
     # update acc_o
     p = p.to(v.dtype)
 
-    tl.store(acc_o, acc_o+tl.dot(p, v))
+    acc_o = acc_o+tl.dot(p, v)
 
     # -- update statistics
     m_i = m_ij
-    tl.store(m_i, m_ij)
 
     l_i_new = tl.exp(lse_i - m_ij) + l_ij
-    tl.store(lse_i, m_ij + tl.log(l_i_new))
+    lse_i = m_ij + tl.log(l_i_new)
+
+    return acc_o, m_i, lse_i
 
 
 
@@ -319,9 +320,13 @@ def _fwd_kernel_causal_bert(
             + (offs_m[:, None] * stride_bm + offs_n[None, :])
         )
 
-    weight_ptrs = Weight + off_h * stride_wh
-    offs_w = tl.arange(0, BLOCK_HEADDIM)[:, None] * 2*BLOCK_HEADDIM + tl.arange(0, 2*BLOCK_HEADDIM)[None, :]
-    weight = tl.load(weight_ptrs + offs_w).to(tl.float32)
+    # weight for key, value projection for lookahead
+    w_ptrs = Weight + off_h * stride_wh
+    offs_w_k = tl.arange(0, BLOCK_HEADDIM)[:, None] * 2*BLOCK_HEADDIM + tl.arange(0, BLOCK_HEADDIM)[None, :]
+    offs_w_v = tl.arange(0, BLOCK_HEADDIM)[:, None] * 2*BLOCK_HEADDIM + tl.arange(BLOCK_HEADDIM, 2*BLOCK_HEADDIM)[None, :]
+
+    w_k = tl.load(w_ptrs + offs_w_k).to(tl.float32)
+    w_v = tl.load(w_ptrs + offs_w_v).to(tl.float32)
 
     # initialize pointer to m and l
     t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
@@ -373,7 +378,8 @@ def _fwd_kernel_causal_bert(
             else:
                 bias_from_n = None
 
-            _fwd_kernel_inner(q=q_from_n, k=k_from_n, v=v_from_n, bias=bias_from_n,
+            acc_o_from_n, m_i_from_n, lse_i_from_n = \
+                  _fwd_kernel_inner(q=q_from_n, k=k_from_n, v=v_from_n, bias=bias_from_n,
                 acc_o=acc_o_from_n, m_i=m_i_from_n, lse_i=lse_i_from_n, 
                 start_n=start_n, t_ptrs=t_ptrs,
                 offs_m=offs_m, offs_n=offs_n, offs_d=offs_d, 
@@ -384,16 +390,19 @@ def _fwd_kernel_causal_bert(
                 )
 
         acc_o_from_n = _o_scale(acc_o=acc_o_from_n, m_i=m_i_from_n, lse_i=lse_i_from_n, t_ptrs=t_ptrs) # (bN, d)
-        delta_k = tl.dot(acc_o_from_n, weight[:, :BLOCK_HEADDIM])   
-        delta_v = tl.dot(acc_o_from_n, weight[:, :BLOCK_HEADDIM])
+        delta_k = tl.dot(acc_o_from_n, w_k)   
+        delta_v = tl.dot(acc_o_from_n, w_v)
 
         # outer most loop attention
         k = _load_k(k_ptrs=k_ptrs, start_n=start_n, stride_kn=stride_kn, offs_d=offs_d, offs_n=offs_n, seqlen_k=seqlen_k,
                     headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_M, EVEN_N=EVEN_N)
         k += delta_k
+        k = k.to(tl.float16)
+
         v = _load_v(v_ptrs=v_ptrs, start_n=start_n, stride_vn=stride_vn, offs_d=offs_d, offs_n=offs_n, seqlen_k=seqlen_k,
                     headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_N, EVEN_N=EVEN_N)
         v += delta_v
+        v = v.to(tl.float16)
 
         if BIAS_TYPE != "none":
             bias = _load_bias(b_ptrs=b_ptrs, start_n=start_n, offs_m=offs_m, offs_n=offs_n, 
@@ -401,16 +410,16 @@ def _fwd_kernel_causal_bert(
         else:
             bias = None
 
-        _fwd_kernel_inner(q=q, k=k, v=v, bias=bias,
+        acc_o, m_i, lse_i = _fwd_kernel_inner(q=q, k=k, v=v, bias=bias,
                           acc_o=acc_o, m_i=m_i, lse_i=lse_i, start_n=start_n, 
-                          k_ptrs=k_ptrs, v_ptrs=v_ptrs, b_ptrs=b_ptrs, t_ptrs=t_ptrs,
-                          offs_m=offs_m, offs_n=offs_n, offs_d=offs_d, headdim=headdim, softmax_scale=softmax_scale,
-                        stride_kn=stride_kn, stride_vn=stride_vn, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
+                          t_ptrs=t_ptrs,
+                          offs_m=offs_m, offs_n=offs_n, offs_d=offs_d, 
+                          headdim=headdim, softmax_scale=softmax_scale, seqlen_k=seqlen_k,
                         EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=EVEN_M, EVEN_N=EVEN_N,
                         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BIAS_TYPE=BIAS_TYPE, IS_CAUSAL=IS_CAUSAL,
                           )
 
-    acc_o = _o_scale(acc_o=acc_o, m_i=m_i, lse_i=lse_i, acc_o=acc_o, t_ptrs=t_ptrs)
+    acc_o = _o_scale(acc_o=acc_o, m_i=m_i, lse_i=lse_i, t_ptrs=t_ptrs)
 
     # rematerialize offsets to save registers
     start_m = tl.program_id(0)
@@ -478,7 +487,8 @@ def _flash_attn_causal_bert_forward(q, k, v, w, bias=None, causal=False, softmax
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    BLOCK = 128
+    BLOCK = 64
+    LA_BLOCK_N_SIZE = 2
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
     _fwd_kernel_causal_bert[grid](
@@ -519,6 +529,7 @@ def _flash_attn_causal_bert_forward(q, k, v, w, bias=None, causal=False, softmax
         BLOCK_HEADDIM,
         BLOCK_M=BLOCK,
         BLOCK_N=BLOCK,
+        LA_BLOCK_N_SIZE=LA_BLOCK_N_SIZE,
         num_warps=num_warps,
         num_stages=1,
     )
