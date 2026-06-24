@@ -77,7 +77,7 @@ def causal_bert_torch(q, k, v, w, causal=False, softmax_scale=None,
 
     for mb in range(nM):
         start_m = mb
-        offs_m = mb * BM + ar
+        offs_m = mb * BM + torch.arange(BM, device=dev)
         q_main = Q[:, :, mb * BM:(mb + 1) * BM, :]
         end_n = S if not causal else min((mb + 1) * BM, S)
 
@@ -87,7 +87,7 @@ def causal_bert_torch(q, k, v, w, causal=False, softmax_scale=None,
 
         for start_n in range(0, end_n, BN):
             q_from_n = Q[:, :, start_n:start_n + BN, :]
-            offs_m_from_n = start_n + ar
+            offs_m_from_n = start_n + torch.arange(BM, device=dev)
             lse_i_from_n = torch.full((B, H, BN), NEG, dtype=torch.float32, device=dev)
             m_i_from_n = torch.full((B, H, BN), NEG, dtype=torch.float32, device=dev)
             acc_o_from_n = torch.zeros(B, H, BN, D, dtype=torch.float32, device=dev)
@@ -131,7 +131,7 @@ import warnings
 import torch
 
 
-def causal_bert_torch_v2(
+def causal_bert_torch_v1(
     q, k, v, w,
     causal=True,
     softmax_scale=None,

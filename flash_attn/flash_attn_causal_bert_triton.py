@@ -346,8 +346,8 @@ def _fwd_kernel_causal_bert(
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         # prologue
-        lse_i_from_n = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-        m_i_from_n = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        lse_i_from_n = tl.zeros([BLOCK_N], dtype=tl.float32) - float("inf")
+        m_i_from_n = tl.zeros([BLOCK_N], dtype=tl.float32) - float("inf")
         acc_o_from_n = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 
         offs_m_from_n = start_n + tl.arange(0, BLOCK_N) # column n as query m
@@ -372,21 +372,15 @@ def _fwd_kernel_causal_bert(
                 v_from_n = _load_v(v_ptrs=v_ptrs, start_n=next_n, stride_vn=stride_vn, offs_d=offs_d, offs_n=offs_n, seqlen_k=start_m*BLOCK_M,
                         headdim=headdim, EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=tl.constexpr(False), EVEN_N=tl.constexpr(False))
 
-                if BIAS_TYPE != "none":
-                    bias_from_n = _load_bias(b_ptrs=b_ptrs, start_n=next_n, offs_m=offs_m_from_n, offs_n=offs_n, 
-                                    seqlen_q=seqlen_q, seqlen_k=seqlen_k, BIAS_TYPE=BIAS_TYPE, EVEN_M=EVEN_M, EVEN_N=EVEN_N)
-                else:
-                    bias_from_n = None
-
                 acc_o_from_n, m_i_from_n, lse_i_from_n = \
-                    _fwd_kernel_inner(q=q_from_n, k=k_from_n, v=v_from_n, bias=bias_from_n,
+                    _fwd_kernel_inner(q=q_from_n, k=k_from_n, v=v_from_n, bias=None,
                     acc_o=acc_o_from_n, m_i=m_i_from_n, lse_i=lse_i_from_n, 
                     start_n=next_n, t_ptrs=t_ptrs,
                     offs_m=offs_m_from_n, offs_n=offs_n, offs_d=offs_d, 
                     headdim=headdim, softmax_scale=softmax_scale,
                     seqlen_k=start_m*BLOCK_M,
                     EVEN_HEADDIM=EVEN_HEADDIM, EVEN_M=tl.constexpr(False), EVEN_N=tl.constexpr(False),
-                    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BIAS_TYPE=BIAS_TYPE, IS_CAUSAL=tl.constexpr(False),
+                    BLOCK_M=BLOCK_N, BLOCK_N=BLOCK_N, BIAS_TYPE='none', IS_CAUSAL=tl.constexpr(False),
                     )
 
         # when start_m  <= start_n, no look ahead iterations take place. therefore, m_i, lse_i are all infinite.
@@ -496,7 +490,10 @@ def _flash_attn_causal_bert_forward(q, k, v, w, bias=None, causal=False, softmax
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    BLOCK = 64
+    
+    BLOCK_M = 16
+    BLOCK_N = 64
+
     LA_BLOCK_N_SIZE = 2
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
@@ -536,8 +533,8 @@ def _flash_attn_causal_bert_forward(q, k, v, w, bias=None, causal=False, softmax
         bias_type,
         causal,
         BLOCK_HEADDIM,
-        BLOCK_M=BLOCK,
-        BLOCK_N=BLOCK,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
         LA_BLOCK_N_SIZE=LA_BLOCK_N_SIZE,
         num_warps=num_warps,
         num_stages=1,
