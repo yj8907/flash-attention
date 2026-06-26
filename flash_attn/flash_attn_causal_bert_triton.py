@@ -1305,9 +1305,9 @@ def _flash_attn_backward(
         bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
     bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
 
-    # BLOCK_M = 128
-    # BLOCK_N = 64
-    # num_warps = 4
+    BLOCK_M = 128
+    BLOCK_N = 16
+    num_warps = 4
     grid = lambda META: (
         triton.cdiv(seqlen_k, META["BLOCK_N"]) if META["SEQUENCE_PARALLEL"] else 1,
         batch * nheads,
@@ -1358,9 +1358,9 @@ def _flash_attn_backward(
         bias_type,
         causal,
         BLOCK_HEADDIM,
-        # SEQUENCE_PARALLEL=False,
-        # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        # num_warps=num_warps,
-        # num_stages=1,
+        SEQUENCE_PARALLEL=False,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=1,
     )
     dq.copy_(dq_accum)
